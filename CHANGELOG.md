@@ -3,6 +3,59 @@
 All notable changes to **Auction Tracker** are recorded in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [5.1.0] - 2026-10-18
+
+### Changed
+- **Sold now means sale mails you have seen and left in the mailbox.** Some
+  people keep their sale mail and let it build up, so the Sold column counts
+  mails holding gold that were seen at the last mailbox visit and have not been
+  collected. Collecting one takes it off straight away, and mails past their
+  30 days are not counted.
+  - Sales the Auction House list marks as sold, and sales you have not yet seen
+    in a mailbox, are no longer counted in Sold. A character with no mailbox
+    visit yet shows a dash.
+  - The list's sold flags are still used behind the scenes so a sale is never
+    taken out of Live or Expired twice.
+- **Sold tooltip.** Hover a Sold cell or the Sold column header to see "Mail
+  containing gold that you have seen but chose to leave". The cell also shows
+  the sales waiting, gold waiting, soonest mail expiry and when the mailbox was
+  last checked. This replaces the tooltip that appeared over the whole row.
+
+### Removed
+- **Estimated sales** (added in 5.0.0): sales guessed from auctions leaving the
+  list are no longer tracked, and the "Estimated sales not yet in mailbox
+  check" tooltip line is gone. Saved estimates are cleared once on the first
+  login with this version (`dataVersion` 4).
+
+### Notes
+- `.toc` version updated to 5.1.0.
+
+## [5.0.3] - 2026-10-18
+
+### Fixed
+- **Mail figures now reset when you open an empty mailbox.** The mailbox was
+  only read when the game sent `MAIL_INBOX_UPDATE`, and that event may never
+  fire for an empty inbox (or can fire before the addon is ready). The old
+  "Sales waiting in mail" and Sold figures then stayed on the character.
+  Opening the mailbox now also queues a scan, 0.5 and 2 seconds after
+  `MAIL_SHOW`, so the inbox has time to load. The existing scan on
+  `MAIL_INBOX_UPDATE` is unchanged.
+- **Collected expired auctions no longer stay in the Expired column.** The
+  red Expired count only cleared at the next Auction House scan, even after you
+  had taken the returned items from the mailbox. Now, at each mailbox scan, the
+  inbox's "Auction expired" mails are counted. If the whole inbox was read and
+  holds fewer of them than the list has expired auctions, the extra expired
+  auctions (earliest first) are removed. This happens when the mailbox is
+  opened, with no Auction House visit needed. Nothing is removed if the inbox
+  was only partly shown.
+- A scan queued just before the mailbox closes no longer blocks the next
+  scan from being queued.
+
+### Notes
+- Scans still only run while the mailbox is open, and are still held back
+  while a gold take is in progress.
+- `.toc` version updated to 5.0.3.
+
 ## [5.0.2] - 2026-10-16
 
 ### Removed

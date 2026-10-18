@@ -85,18 +85,17 @@ end
 local MAIL_LIFETIME = 30 * 86400   -- how long the game keeps a mail
 
 -- Stats() adjusted for the last mailbox scan (see ScanMailbox):
---   sold    : sale mails waiting in the mailbox (or auctions the list flags as sold)
+--   sold    : sale mails holding gold that were seen in the mailbox and left there
 --   a sale mail that arrived after the last Auction House scan belongs to an auction
 --   the list still counts as expired/live, so take it out of those counts
 local function Counts(c, now)
     local live, unsure, sold, expired, soonest = Stats(c, now)
     local m = c.mail
 
-    -- Estimated sales are only good for as long as a sale mail would last
-    local inf = c.soldInf or 0
-    if inf > 0 and (now - (c.soldInfAt or 0)) > MAIL_LIFETIME then inf = 0 end
-
-    if not m then return live, unsure, math.max(sold, inf), expired, soonest end
+    -- Sold is only what has been seen in the mailbox and left there (see below), so with
+    -- no mailbox data there is nothing to show. The auction list's own sold flags are
+    -- still used further down to avoid taking the same sale out of live/expired twice.
+    if not m then return live, unsure, 0, expired, soonest end
 
     local lastScan = c.lastScan or 0
     local pend = 0
@@ -116,8 +115,7 @@ local function Counts(c, now)
     for _, t in ipairs(m.arrivals or {}) do
         if t + MAIL_LIFETIME > now then waiting = waiting + 1 end
     end
-    sold = math.max(sold, waiting + inf)
-    return live, unsure, sold, expired, soonest
+    return live, unsure, waiting, expired, soonest
 end
 
 local function LiveText(live, unsure)
@@ -190,34 +188,6 @@ local function ScanOwned()
     for _, p in ipairs(char.auctions or {}) do
         if p.pending and p.id and not seen[p.id] and (now - (p.created or 0)) < 20 then
             list[#list + 1] = p
-        end
-    end
-
-    -- Auctions that left the list before their earliest possible expiry can't have expired.
-    -- Cancellations were already removed by the cancel event, so these were sales.
-    -- (Only trusted when the game says it sent the complete list.)
-    local hasFullList = C_AuctionHouse.HasFullOwnedAuctionResults
-    if hasFullList and hasFullList() and char.lastScan then
-        local inList = {}
-        for _, e in ipairs(list) do inList[e.id] = true end
-        local gone = 0
-        for _, a in ipairs(char.auctions or {}) do
-            if not a.sold and type(a.id) == "number" and not inList[a.id] and a.minExp > now then
-                gone = gone + 1
-            end
-        end
-        if gone > 0 then
-            -- Sale mails that arrived since the previous scan and are still waiting already
-            -- count towards the Sold column, so only add the sales they don't explain.
-            local explained = 0
-            for _, t in ipairs(char.mail and char.mail.arrivals or {}) do
-                if t > char.lastScan - 60 then explained = explained + 1 end
-            end
-            local extra = math.max(0, gone - explained)
-            if extra > 0 then
-                char.soldInf = (char.soldInf or 0) + extra
-                char.soldInfAt = now
-            end
         end
     end
 
@@ -349,7 +319,7 @@ local function FormatToPattern(fmt)
     return "^" .. p
 end
 
-local soldPattern, outbidPattern
+local soldPattern, outbidPattern, expiredPattern
 
 local pending = {}   -- mail money we saw being taken, awaiting confirmation
 local lastMoney
@@ -453,8 +423,6 @@ local function Credit(p)
             if p.arrived and p.arrived > lastScan + 60 then
                 -- sold after our last Auction House scan: still in the list as live/expired
                 ConsumeEntries(c, 1, now)
-            elseif (c.soldInf or 0) > 0 then
-                c.soldInf = c.soldInf - 1       -- an estimated sale that has now been collected
             else
                 for i, a in ipairs(c.auctions or {}) do
                     if a.sold then
@@ -534,8 +502,12 @@ local function ScanMailbox()
     -- Sale mails that still hold gold. Mail lasts 30 days, so daysLeft also tells us
     -- when each one arrived.
     local arrivals, gold, soonest = {}, 0, nil
+    local expiredMails = 0   -- returned-item mails from auctions that ran out
     for i = 1, numItems do
         local subject, money, daysLeft = MailHeader(i)
+        if subject and expiredPattern and subject:find(expiredPattern) then
+            expiredMails = expiredMails + 1
+        end
         if subject and money and money > 0 and subject:find(soldPattern) then
             gold = gold + money
             local expiry = daysLeft and (now + daysLeft * 86400) or nil
@@ -562,8 +534,29 @@ local function ScanMailbox()
         post = post, stamp = lastScan, scanned = now,
         partial = ((total or numItems) > numItems) or nil,
     }
-    c.soldInf = 0   -- the mailbox now shows the real number of sales
-    c.soldInfAt = nil
+    -- An auction that expired comes back as a mail. If the whole inbox was read and holds
+    -- fewer of those mails than the list has expired auctions, the rest were already
+    -- collected, so drop them. The mailbox is the source of truth for expiries.
+    if expiredPattern and not c.mail.partial and c.auctions then
+        local stale = {}
+        for idx, a in ipairs(c.auctions) do
+            if not a.sold and a.maxExp <= now then
+                stale[#stale + 1] = idx
+            end
+        end
+        local drop = #stale - expiredMails
+        if drop > 0 then
+            table.sort(stale, function(x, y) return c.auctions[x].maxExp < c.auctions[y].maxExp end)
+            local kill = {}
+            for k = 1, drop do kill[stale[k]] = true end
+            local keep = {}
+            for idx, a in ipairs(c.auctions) do
+                if not kill[idx] then keep[#keep + 1] = a end
+            end
+            c.auctions = keep
+        end
+    end
+    c.soldInf, c.soldInfAt = nil, nil   -- estimates are no longer used
     AT:Refresh()
 end
 
@@ -580,6 +573,7 @@ end
 local function SetupMailHooks()
     soldPattern   = FormatToPattern(AUCTION_SOLD_MAIL_SUBJECT)
     outbidPattern = FormatToPattern(AUCTION_OUTBID_MAIL_SUBJECT)
+    expiredPattern = FormatToPattern(AUCTION_EXPIRED_MAIL_SUBJECT)
     lastMoney = GetMoney()
 
     local a = HookFn("TakeInboxMoney", QueueMail)
@@ -780,23 +774,22 @@ local function ShowForget(r)
     r.forget:Show()
 end
 
--- Hovering a character row shows what is waiting in their mailbox (from the last mailbox visit)
-local function ShowRowTooltip(r)
-    local c = r.charKey and AuctionTrackerDB.chars[r.charKey]
-    if not c then return end
-    local m = c.mail
+local SOLD_TIP = "Mail containing gold that you have seen but chose to leave"
+
+-- Hovering the Sold column explains it, and shows what is waiting in that character's
+-- mailbox (from the last mailbox visit)
+local function ShowSoldTooltip(owner, c)
+    GameTooltip:SetOwner(owner, "ANCHOR_CURSOR_RIGHT")
+    GameTooltip:AddLine("Sold", 1, 1, 1)
+    GameTooltip:AddLine(SOLD_TIP, 0.8, 0.8, 0.8, true)
+    local m = c and c.mail
     local now = GetServerTime()
     local waiting = 0
     for _, t in ipairs(m and m.arrivals or {}) do
         if t + MAIL_LIFETIME > now then waiting = waiting + 1 end
     end
-    local est = c.soldInf or 0
-    if est > 0 and (now - (c.soldInfAt or 0)) > MAIL_LIFETIME then est = 0 end
-    if waiting == 0 and est == 0 then return end
-
-    GameTooltip:SetOwner(r, "ANCHOR_CURSOR_RIGHT")
-    GameTooltip:AddLine(c.name or r.charKey, 1, 1, 1)
     if waiting > 0 then
+        GameTooltip:AddLine(" ")
         GameTooltip:AddDoubleLine("Sales waiting in mail", tostring(waiting), 0.8, 0.8, 0.8, C.good[1], C.good[2], C.good[3])
         GameTooltip:AddDoubleLine("Gold waiting", FormatGold(m.gold), 0.8, 0.8, 0.8, 1, 1, 1)
         if m.expiry then
@@ -808,10 +801,6 @@ local function ShowRowTooltip(r)
         if m.partial then
             GameTooltip:AddLine("Only the mails shown in the inbox were counted.", C.dim[1], C.dim[2], C.dim[3])
         end
-    end
-    if est > 0 then
-        GameTooltip:AddDoubleLine("Estimated sales not yet in mailbox check", tostring(est), 0.8, 0.8, 0.8, C.good[1], C.good[2], C.good[3])
-        GameTooltip:AddLine("Auctions that left your list before they could have expired.", C.dim[1], C.dim[2], C.dim[3])
     end
     GameTooltip:Show()
 end
@@ -849,8 +838,21 @@ local function NewRow(parent)
     end)
     r:SetScript("OnEnter", function()
         ShowForget(r)
-        ShowRowTooltip(r)
     end)
+
+    -- Invisible hover area over the Sold cell
+    r.soldHit = CreateFrame("Frame", nil, r)
+    r.soldHit:EnableMouse(true)
+    r.soldHit:SetScript("OnEnter", function(self)
+        ShowForget(r)
+        local c = r.charKey and AuctionTrackerDB.chars[r.charKey]
+        if c then ShowSoldTooltip(self, c) end
+    end)
+    r.soldHit:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+        if not r:IsMouseOver() then r.forget:Hide() end
+    end)
+    r.soldHit:Hide()
     r:SetScript("OnLeave", function()
         GameTooltip:Hide()
         if not r:IsMouseOver() then r.forget:Hide() end
@@ -903,6 +905,7 @@ local function ApplyLayout(r, mode, y, h)
     r.bg:SetColorTexture(0, 0, 0, 0)
     r.accent:Hide()
     r.forget:Hide()
+    r.soldHit:Hide()
     r.charKey = nil
     r:Show()
 end
@@ -931,6 +934,12 @@ local function SetCharRow(r, y, k, c, now, zebra)
     -- Live, sold and expired are kept as three separate numbers
     r.c1:SetFont(FONT, 16, "")
     r.c1:SetText(Hex(C.text) .. live .. "|r" .. (unsure > 0 and (Hex(C.dim) .. " +" .. unsure .. "?|r") or ""))
+
+    r.soldHit:ClearAllPoints()
+    r.soldHit:SetPoint("TOPLEFT", r.c2, "TOPLEFT", -6, 8)
+    r.soldHit:SetPoint("BOTTOMRIGHT", r.c2, "BOTTOMRIGHT", 6, -8)
+    r.soldHit:SetFrameLevel(r:GetFrameLevel() + 2)
+    r.soldHit:Show()
 
     if sold > 0 then
         r.c2:SetFont(FONT, 16, "")
@@ -1373,8 +1382,17 @@ local function BuildFrame()
         hb:SetPoint("BOTTOMRIGHT", fs, "BOTTOMRIGHT", 4, -4)
         bar.btns[i] = hb
         hb:SetScript("OnClick", function() AT:SortBy(i) end)
-        hb:SetScript("OnEnter", function() fs:SetTextColor(C.text[1], C.text[2], C.text[3]) end)
+        hb:SetScript("OnEnter", function(self)
+            fs:SetTextColor(C.text[1], C.text[2], C.text[3])
+            if i == 3 and AT.tab == "auctions" then
+                GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+                GameTooltip:AddLine("Sold", 1, 1, 1)
+                GameTooltip:AddLine(SOLD_TIP, 0.8, 0.8, 0.8, true)
+                GameTooltip:Show()
+            end
+        end)
         hb:SetScript("OnLeave", function()
+            GameTooltip:Hide()
             if COLKEYS[AT.tab] then UpdateHeaders(AT.tab) end
         end)
     end
@@ -1925,6 +1943,15 @@ ev:SetScript("OnEvent", function(_, event, ...)
             db.dataVersion = 3
         end
 
+        -- Estimated sales are no longer used; clear what earlier versions saved.
+        if (db.dataVersion or 0) < 4 then
+            for _, c in pairs(db.chars) do
+                c.soldInf = nil
+                c.soldInfAt = nil
+            end
+            db.dataVersion = 4
+        end
+
         db.minimap = db.minimap or { angle = 215 }
         db.collapsed = nil
         db.popup = db.popup or {}
@@ -1973,9 +2000,14 @@ ev:SetScript("OnEvent", function(_, event, ...)
 
     elseif event == "MAIL_SHOW" then
         AT.mailOpen = true
+        -- An empty mailbox may never fire MAIL_INBOX_UPDATE, which left old sale-mail
+        -- figures in place. Scan on open too, once the inbox has had time to load.
+        C_Timer.After(0.5, QueueMailScan)
+        C_Timer.After(2, QueueMailScan)
 
     elseif event == "MAIL_CLOSED" then
         AT.mailOpen = false
+        mailScanQueued = false
 
     elseif event == "MAIL_INBOX_UPDATE" then
         QueueMailScan()
